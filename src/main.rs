@@ -2,10 +2,10 @@ use clap::{Parser, Subcommand};
 use ethers_core::{
     k256::{ecdsa::SigningKey, schnorr::CryptoRngCore},
     types::{Address, H256, U256},
-    utils::{get_contract_address, get_create2_address_from_hash, hex::ToHex},
+    utils::{get_contract_address, get_create2_address_from_hash, secret_key_to_address},
 };
-use ethers_signers::{Signer, Wallet};
 use std::{
+    fmt::Debug,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -19,12 +19,18 @@ struct Cli {
     pub target: Address,
     #[clap(long)]
     pub mask: Address,
+    /// Number of cores to use
+    #[clap(long, default_value_t = num_cpus::get() - 1)]
+    pub n_cores: usize,
+    /// Debug info every n iterations
+    #[clap(long, default_value_t = 100000)]
+    pub n_iter: usize,
     #[clap(subcommand)]
     pub command: Command,
 }
 
 /// Generates salt that is used in create-2
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Copy, Parser)]
 struct Create2Address {
     /// deployer contract
     #[clap(long)]
@@ -34,14 +40,14 @@ struct Create2Address {
     pub codehash: H256,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Copy, Parser)]
 struct ContractAddress {
     /// next deployer nonce
-    #[clap(long)]
+    #[clap(long, default_value_t = U256::zero())]
     pub nonce: U256,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Copy, Clone, Subcommand)]
 enum Command {
     /// Generate EOA account address
     Address,
@@ -55,17 +61,12 @@ fn test_address(address: &Address, target: &Address, mask: &Address) -> bool {
     address & mask == target & mask
 }
 
-#[allow(unused)]
 fn generate_address(rng: &mut impl CryptoRngCore, target: &Address, mask: &Address) -> bool {
-    let signing_key = SigningKey::random(rng);
-    let wallet = Wallet::from(signing_key.clone());
-    let address = wallet.address();
+    let private_key = SigningKey::random(rng);
+    let address = secret_key_to_address(&private_key);
     if test_address(&address, target, mask) {
         println!("address: {address:?}");
-        println!(
-            "privateKey: {:?}",
-            signing_key.to_bytes().encode_hex::<String>()
-        );
+        println!("privateKey: {:?}", private_key.to_bytes());
         true
     } else {
         false
@@ -78,34 +79,28 @@ fn generate_contract_address(
     mask: &Address,
     nonce: &U256,
 ) -> bool {
-    let signing_key = SigningKey::random(rng);
-    let wallet = Wallet::from(signing_key.clone());
-    let address = wallet.address();
+    let private_key = SigningKey::random(rng);
+    let address = secret_key_to_address(&private_key);
     let contract = get_contract_address(address, nonce);
     if test_address(&contract, target, mask) {
         println!("contract: {contract:?}");
         println!("address: {address:?}");
-        println!(
-            "privateKey: {:?}",
-            signing_key.to_bytes().encode_hex::<String>()
-        );
+        println!("privateKey: {:?}", private_key.to_bytes());
         true
     } else {
         false
     }
 }
 
-// todo: optimize
-#[allow(unused)]
 fn generate_create2_address(
     rng: &mut impl CryptoRngCore,
     target: &Address,
     mask: &Address,
-    factory: Address,
+    factory: &Address,
     codehash: &H256,
 ) -> bool {
     let salt = H256::random_using(rng);
-    let contract = get_create2_address_from_hash(factory, salt, codehash);
+    let contract = get_create2_address_from_hash(*factory, salt, codehash);
     if test_address(&contract, target, mask) {
         println!("contract: {contract:?}");
         println!("salt: {salt:?}");
@@ -115,12 +110,46 @@ fn generate_create2_address(
     }
 }
 
+fn _generate_contract_address(
+    rng: &mut impl CryptoRngCore,
+    nonce: &U256,
+) -> (Address, Box<dyn Debug>) {
+    let private_key = SigningKey::random(rng);
+    let address = secret_key_to_address(&private_key);
+    let contract = get_contract_address(address, nonce);
+    (contract, Box::new((private_key.to_bytes(), address)))
+}
+
+fn _generate_address(rng: &mut impl CryptoRngCore) -> (Address, Box<dyn Debug>) {
+    let private_key = SigningKey::random(rng);
+    let address = secret_key_to_address(&private_key);
+    (address, Box::new(private_key.to_bytes()))
+}
+
+fn _generate_create2_address(
+    rng: &mut impl CryptoRngCore,
+    factory: &Address,
+    codehash: &H256,
+) -> (Address, Box<dyn Debug>) {
+    let salt = H256::random_using(rng);
+    let contract = get_create2_address_from_hash(*factory, salt, codehash);
+    (contract, Box::new(salt))
+}
+
 fn main() {
-    let cli = Cli::parse();
+    let Cli {
+        command,
+        target,
+        mask,
+        n_cores,
+        ..
+    } = Cli::parse();
+
     let exit = Arc::new(AtomicBool::new(false));
-    let num_cpus = num_cpus::get();
+
     let mut handles = vec![];
-    for _ in 0..num_cpus - 1 {
+
+    for _ in 0..n_cores {
         let exit = exit.clone();
         handles.push(thread::spawn(move || {
             let mut rng = rand::thread_rng();
@@ -128,12 +157,35 @@ fn main() {
                 if exit.load(Ordering::Relaxed) {
                     return;
                 }
-                if generate_contract_address(&mut rng, &cli.target, &cli.mask, &U256::zero()) {
+                let success = match &command {
+                    Command::Address => generate_address(&mut rng, &target, &mask),
+                    Command::ContractAddress(ContractAddress { nonce }) => {
+                        generate_contract_address(&mut rng, &target, &mask, nonce)
+                    }
+                    Command::Create2Address(Create2Address { factory, codehash }) => {
+                        generate_create2_address(&mut rng, &target, &mask, factory, codehash)
+                    }
+                };
+                if success {
                     exit.store(true, Ordering::Relaxed);
                 }
+                // let (address, params) = match &command {
+                //     Command::Address => _generate_address(&mut rng),
+                //     Command::ContractAddress(ContractAddress { nonce }) => {
+                //         _generate_contract_address(&mut rng, nonce)
+                //     }
+                //     Command::Create2Address(Create2Address { factory, codehash }) => {
+                //         _generate_create2_address(&mut rng, factory, codehash)
+                //     }
+                // };
+                // if test_address(&address, &target, &mask) {
+                //     exit.store(true, Ordering::Relaxed);
+                //     println!("{params:?}");
+                // }
             }
         }));
     }
+
     for hdl in handles {
         hdl.join().unwrap();
     }
