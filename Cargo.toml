@@ -8,6 +8,6 @@ edition = "2021"
 [dependencies]
 clap = { version = "4.2.1", features = ["derive"] }
 ethers-core = "2.0.2"
-ethers-signers = "2.0.2"
+k256 = { version = "0.13.0", features = ["schnorr"] }
 num_cpus = "1.15.0"
 rand = "0.8.5"
