@@ -2,10 +2,12 @@ use clap::{Parser, Subcommand};
 use ethers_core::{
     k256::{ecdsa::SigningKey, schnorr::CryptoRngCore},
     types::{Address, H256, U256},
-    utils::{get_contract_address, get_create2_address_from_hash, secret_key_to_address},
+    utils::{
+        get_contract_address, get_create2_address_from_hash, hex::ToHex, secret_key_to_address,
+    },
 };
 use std::{
-    fmt::Debug,
+    fmt::{Debug, Display, Formatter, Result as FmtResult},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -57,83 +59,64 @@ enum Command {
     Create2Address(Create2Address),
 }
 
+#[derive(Debug)]
+enum Output {
+    Address(SigningKey),
+    ContractAddress(SigningKey, Address),
+    Create2Address(H256),
+}
+
+impl Display for Output {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            x @ (Self::Address(private_key) | Self::ContractAddress(private_key, ..)) => {
+                let private_key = private_key.to_bytes().encode_hex::<String>();
+                match x {
+                    Self::Address(..) => f
+                        .debug_struct("Address")
+                        .field("private_key", &private_key)
+                        .finish(),
+                    Self::ContractAddress(.., deployer) => f
+                        .debug_struct("ContractAddress")
+                        .field("private_key", &private_key)
+                        .field("deployer", deployer)
+                        .finish(),
+                    _ => unreachable!(),
+                }
+            }
+            Self::Create2Address(salt) => f
+                .debug_struct("Create2Address")
+                .field("salt", salt)
+                .finish(),
+        }
+    }
+}
+
 fn test_address(address: &Address, target: &Address, mask: &Address) -> bool {
     address & mask == target & mask
 }
 
-fn generate_address(rng: &mut impl CryptoRngCore, target: &Address, mask: &Address) -> bool {
+fn generate_address(rng: &mut impl CryptoRngCore) -> (Address, Output) {
     let private_key = SigningKey::random(rng);
     let address = secret_key_to_address(&private_key);
-    if test_address(&address, target, mask) {
-        println!("address: {address:?}");
-        println!("privateKey: {:?}", private_key.to_bytes());
-        true
-    } else {
-        false
-    }
+    (address, Output::Address(private_key))
 }
 
-fn generate_contract_address(
-    rng: &mut impl CryptoRngCore,
-    target: &Address,
-    mask: &Address,
-    nonce: &U256,
-) -> bool {
+fn generate_contract_address(rng: &mut impl CryptoRngCore, nonce: &U256) -> (Address, Output) {
     let private_key = SigningKey::random(rng);
     let address = secret_key_to_address(&private_key);
     let contract = get_contract_address(address, nonce);
-    if test_address(&contract, target, mask) {
-        println!("contract: {contract:?}");
-        println!("address: {address:?}");
-        println!("privateKey: {:?}", private_key.to_bytes());
-        true
-    } else {
-        false
-    }
+    (contract, Output::ContractAddress(private_key, address))
 }
 
 fn generate_create2_address(
     rng: &mut impl CryptoRngCore,
-    target: &Address,
-    mask: &Address,
     factory: &Address,
     codehash: &H256,
-) -> bool {
+) -> (Address, Output) {
     let salt = H256::random_using(rng);
     let contract = get_create2_address_from_hash(*factory, salt, codehash);
-    if test_address(&contract, target, mask) {
-        println!("contract: {contract:?}");
-        println!("salt: {salt:?}");
-        true
-    } else {
-        false
-    }
-}
-
-fn _generate_contract_address(
-    rng: &mut impl CryptoRngCore,
-    nonce: &U256,
-) -> (Address, Box<dyn Debug>) {
-    let private_key = SigningKey::random(rng);
-    let address = secret_key_to_address(&private_key);
-    let contract = get_contract_address(address, nonce);
-    (contract, Box::new((private_key.to_bytes(), address)))
-}
-
-fn _generate_address(rng: &mut impl CryptoRngCore) -> (Address, Box<dyn Debug>) {
-    let private_key = SigningKey::random(rng);
-    let address = secret_key_to_address(&private_key);
-    (address, Box::new(private_key.to_bytes()))
-}
-
-fn _generate_create2_address(
-    rng: &mut impl CryptoRngCore,
-    factory: &Address,
-    codehash: &H256,
-) -> (Address, Box<dyn Debug>) {
-    let salt = H256::random_using(rng);
-    let contract = get_create2_address_from_hash(*factory, salt, codehash);
-    (contract, Box::new(salt))
+    (contract, Output::Create2Address(salt))
 }
 
 fn main() {
@@ -157,31 +140,20 @@ fn main() {
                 if exit.load(Ordering::Relaxed) {
                     return;
                 }
-                let success = match &command {
-                    Command::Address => generate_address(&mut rng, &target, &mask),
+                let (address, output) = match &command {
+                    Command::Address => generate_address(&mut rng),
                     Command::ContractAddress(ContractAddress { nonce }) => {
-                        generate_contract_address(&mut rng, &target, &mask, nonce)
+                        generate_contract_address(&mut rng, nonce)
                     }
                     Command::Create2Address(Create2Address { factory, codehash }) => {
-                        generate_create2_address(&mut rng, &target, &mask, factory, codehash)
+                        generate_create2_address(&mut rng, factory, codehash)
                     }
                 };
-                if success {
+                if test_address(&address, &target, &mask) {
                     exit.store(true, Ordering::Relaxed);
+                    println!("address = {address:?}");
+                    println!("output = {output}");
                 }
-                // let (address, params) = match &command {
-                //     Command::Address => _generate_address(&mut rng),
-                //     Command::ContractAddress(ContractAddress { nonce }) => {
-                //         _generate_contract_address(&mut rng, nonce)
-                //     }
-                //     Command::Create2Address(Create2Address { factory, codehash }) => {
-                //         _generate_create2_address(&mut rng, factory, codehash)
-                //     }
-                // };
-                // if test_address(&address, &target, &mask) {
-                //     exit.store(true, Ordering::Relaxed);
-                //     println!("{params:?}");
-                // }
             }
         }));
     }
