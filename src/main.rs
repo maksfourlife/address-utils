@@ -9,10 +9,11 @@ use ethers_core::{
 use std::{
     fmt::{Debug, Display, Formatter, Result as FmtResult},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     thread,
+    time::Instant,
 };
 
 #[derive(Debug, Parser)]
@@ -26,7 +27,7 @@ struct Cli {
     pub n_cores: usize,
     /// Debug info every n iterations
     #[clap(long, default_value_t = 100000)]
-    pub n_iter: usize,
+    pub n_iter: u64,
     #[clap(subcommand)]
     pub command: Command,
 }
@@ -125,18 +126,25 @@ fn main() {
         target,
         mask,
         n_cores,
+        n_iter,
         ..
     } = Cli::parse();
 
     let exit = Arc::new(AtomicBool::new(false));
 
+    let iter = Arc::new(AtomicU64::new(0));
+    let elapsed = Arc::new(AtomicU64::new(0));
+
     let mut handles = vec![];
 
     for _ in 0..n_cores {
         let exit = exit.clone();
+        let iter = iter.clone();
+        let elapsed = elapsed.clone();
         handles.push(thread::spawn(move || {
             let mut rng = rand::thread_rng();
             loop {
+                let now = Instant::now();
                 if exit.load(Ordering::Relaxed) {
                     return;
                 }
@@ -153,6 +161,15 @@ fn main() {
                     exit.store(true, Ordering::Relaxed);
                     println!("address = {address:?}");
                     println!("output = {output}");
+                }
+
+                let _elapsed =
+                    elapsed.fetch_add(now.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                let iter = iter.fetch_add(1, Ordering::Relaxed);
+
+                if iter % n_iter == 0 {
+                    elapsed.store(0, Ordering::Relaxed);
+                    println!("iter = {iter}, avg = {}", _elapsed / n_iter);
                 }
             }
         }));
